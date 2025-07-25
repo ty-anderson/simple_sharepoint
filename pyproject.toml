@@ -1,8 +1,19 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "simple-sharepoint"
 version = "0.1.0"
-description = "Add your description here"
-requires-python = ">=3.13"
+description = "A SharePoint file management tool for python programs."
+readme = "README.md"
+requires-python = ">=3.10"
 dependencies = [
     "office365-rest-python-client>=2.6.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build",
+    "twine"
 ]
