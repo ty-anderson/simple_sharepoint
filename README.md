@@ -4,21 +4,20 @@ This package is designed to be a simple code interface to manage files in a Shar
 
 ## How to Install
 
-``pip install simple_sharepoint``
+``pip install py_simple_sharepoint``
 
 ## How to Use
 
 ```py
 import os
-from simple_sharepoint import SharePoint
-
+from py_simple_sharepoint import SharePoint
 
 sp = SharePoint(
-        user=os.getenv('USERNAME'),
-        password=os.getenv('PASSWORD'),
-        sharepoint_url="https://example.com/sites/YourSite",
-        library_title="Main Folder"
-    )
+    user=os.getenv('USERNAME'),
+    password=os.getenv('PASSWORD'),
+    sharepoint_url="https://example.com/sites/YourSite",
+    library_title="Main Folder"
+)
 
 sp_path = 'Folder 1/Subfolder'
 # Create a directory in SharePoint

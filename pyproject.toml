@@ -3,8 +3,8 @@ requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "simple-sharepoint"
-version = "0.1.0"
+name = "py_simple_sharepoint"
+version = "0.1.1"
 description = "A SharePoint file management tool for python programs."
 readme = "README.md"
 requires-python = ">=3.10"
