@@ -10,35 +10,23 @@ This package is designed to be a simple code interface to manage files in a Shar
 
 ```py
 import os
-from py_simple_sharepoint import SharePoint
+from py_simple_sharepoint import SharePointClient
 
-sp = SharePoint(
-    user=os.getenv('USERNAME'),
-    password=os.getenv('PASSWORD'),
-    sharepoint_url="https://example.com/sites/YourSite",
-    library_title="Main Folder"
+sp = SharePointClient(
+    tenant_id=os.getenv("SHAREPOINT_CLIENT_TENANT_ID"),
+    client_id=os.getenv("SHAREPOINT_AZURE_APPLICATION_ID"),
+    cert_path=r"Certificate.cer",
+    key_path=r"Certificate.key",
+    site_hostname="<sitename>.sharepoint.com",
+    site_path='/sites/<location>',
+    library_title='Documents'
 )
 
-sp_path = 'Folder 1/Subfolder'
-# Create a directory in SharePoint
-sp.create_directory(sp_path, 'New Folder')
-
-# Upload a file to SharePoint
-sp.upload_file(r'/path/to/file.txt', sp_path)
-
-# get file objects from a directory
-files = sp.get_files(sp_path)
-for file in files:
-    sp.download_file(file)
-    sp.move_file(file, sp_path + '/Archive')
-    sp.delete_file(file)
-
-# get folder by link
-folder = sp.get_folder_by_link(r'/sites/YourSite/Shared Documents/' + sp_path)
-files = sp.get_files(folder)
-for file in files:
-    print(f'Moving file to archive: {file.properties["Name"]}')
-
-
+files = sp.get_files(files_path)
+sp.create_folder(folder_path='Path/to/New Folder')
+sp.upload_file(local_path='file.txt', target_folder='Path/to/Upload Folder')
+sp.download_file(file_path='Path/to/file.txt', download_dir='local/path/to/folder')
+sp.move_file(file_path='path/to/file.txt', target_folder='other/path/to/file')
+sp.rename_file(file_path='path/to/file.txt', new_name='path/to/new file name.txt')
 
 ```

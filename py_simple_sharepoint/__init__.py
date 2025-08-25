@@ -1,321 +1,371 @@
 import os
+import base64
+import json
+import uuid
 import time
+import requests
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography import x509
 from pathlib import Path
-from io import BytesIO
-from collections.abc import Generator
-from office365.sharepoint.client_context import ClientContext
-from office365.runtime.auth.user_credential import UserCredential
-from office365.sharepoint.files.file import File, Folder
 
 
-class SharePoint:
-    def __init__(self,
-                 user: str,
-                 password: str,
-                 sharepoint_url: str,
-                 library_title: str):
-        """
-        Create a SharePoint instance. This allows the user to more easily interact with files in SharePoint.
+class SharePointClient:
+    def __init__(self, tenant_id, client_id, cert_path, key_path, site_hostname, site_path, library_title, key_password=None):
+        self.tenant_id = tenant_id
+        self.client_id = client_id
+        self.cert_path = cert_path
+        self.key_path = key_path
+        self.site_hostname = site_hostname
+        self.site_path = site_path
+        self.library_title = library_title
+        self.key_password = key_password
 
-        :param user: email@email.com
-        :param password: password
-        :param sharepoint_url: "https://example.com/sites/FolderName"
-        :param library_title: "Main Folder"
-        """
-        attempt_counter = 6
-        while True:
+        self.private_key, self.certificate = self._load_key_and_cert()
+        self.access_token = self._get_access_token()
+        self.headers = {"Authorization": f"Bearer {self.access_token}", "Accept": "application/json"}
+
+        # Resolve site + drive once and cache them
+        self.site_id = self._resolve_site()
+        self.drive_id = self._resolve_drive()
+
+    # -------------------------
+    # Internal helpers
+    # -------------------------
+    def _base64url_encode(self, data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
+
+    def _load_key_and_cert(self):
+        # Load private key
+        with open(self.key_path, "rb") as f:
+            private_key = serialization.load_pem_private_key(
+                f.read(),
+                password=(self.key_password.encode() if self.key_password else None),
+            )
+        # Load certificate (PEM or DER)
+        with open(self.cert_path, "rb") as f:
+            cert_data = f.read()
             try:
-                self.sharepoint_url = sharepoint_url
-                self.ctx = ClientContext(self.sharepoint_url).with_credentials(
-                    UserCredential(user, password))
-                library = self.ctx.web.lists.get_by_title(library_title)
-                self.root_folder = library.root_folder
-                self.ctx.load(self.root_folder.folders)
-                self.ctx.execute_query()
-                print('Connected to SharePoint')
-                break
-            except Exception as e:
-                print('Error connecting to SharePoint')
-                time.sleep(1)
-                attempt_counter -= 1
-                if attempt_counter == 0:
-                    raise Exception(f"Could not connect to SharePoint after 6 attempts. Error: {e}")
+                certificate = x509.load_pem_x509_certificate(cert_data)
+            except ValueError:
+                certificate = x509.load_der_x509_certificate(cert_data)
 
-    def create_directory(self, existing_dir_path: str | Path, new_dir_name: str) -> Folder:
-        """
-        Create directory in SharePoint.
+        return private_key, certificate
 
-        :param existing_dir_path: Path or str, list of folder names to get to folder where new folder will be created
-        :param new_dir_name: str, name of folder to create
-        :return: Folder, target folder
-        """
-        if isinstance(existing_dir_path, str):
-            existing_dir_path = Path(existing_dir_path)
+    def _new_jwt_client_assertion(self):
+        aud = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
+        nbf = int(time.time()) - 60
+        exp = int(time.time()) + 300
+        jti = str(uuid.uuid4())
 
-        directory = self.get_directory(existing_dir_path)
-        directory.folders.add(new_dir_name)
-        self.ctx.execute_query()
-        print(f'Created folder {new_dir_name} in {"/".join(existing_dir_path.parts)}')
+        header = {
+            "alg": "RS256",
+            "typ": "JWT",
+            "x5t": self._base64url_encode(self.certificate.fingerprint(hashes.SHA1()))
+        }
+        payload = {
+            "iss": self.client_id,
+            "sub": self.client_id,
+            "aud": aud,
+            "nbf": nbf,
+            "exp": exp,
+            "jti": jti
+        }
 
-        path_to_target = existing_dir_path / new_dir_name
-        directory = self.get_directory(path_to_target)
+        header_b64 = self._base64url_encode(json.dumps(header, separators=(",", ":")).encode())
+        payload_b64 = self._base64url_encode(json.dumps(payload, separators=(",", ":")).encode())
+        unsigned = f"{header_b64}.{payload_b64}"
 
-        return directory
+        signature = self.private_key.sign(
+            unsigned.encode("ascii"),
+            padding.PKCS1v15(),
+            hashes.SHA256()
+        )
+        sig_b64 = self._base64url_encode(signature)
 
-    def _get_or_create_subfolder(self, parent: Folder, name: str) -> Folder:
-        """
-        Return a subfolder called `name` under `parent`.
-        If it doesn’t exist, create it.
+        return f"{unsigned}.{sig_b64}"
 
-        Needs additional testing but could replace create_directory and get_directory
-        """
-        # Load child folders just once
-        self.ctx.load(parent.folders)
-        self.ctx.execute_query()
+    def _get_access_token(self, scope="https://graph.microsoft.com/.default"):
+        assertion = self._new_jwt_client_assertion()
+        body = {
+            "client_id": self.client_id,
+            "scope": scope,
+            "grant_type": "client_credentials",
+            "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            "client_assertion": assertion
+        }
+        token_endpoint = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
+        resp = requests.post(token_endpoint, data=body)
+        resp.raise_for_status()
+        return resp.json()["access_token"]
 
-        for f in parent.folders:  # check if it already exists
-            if f.properties["Name"].lower() == name.lower():
-                return f
+    def _resolve_site(self):
+        site_url = f"https://graph.microsoft.com/v1.0/sites/{self.site_hostname}:{self.site_path}"
+        site = requests.get(site_url, headers=self.headers).json()
+        if "id" not in site:
+            raise Exception(f"Failed to resolve site id for {self.site_hostname}{self.site_path}")
+        return site["id"]
 
-        # Otherwise create it
-        new_folder = parent.folders.add(name)
-        self.ctx.execute_query()
-        return new_folder
+    def _resolve_drive(self):
+        drives_url = f"https://graph.microsoft.com/v1.0/sites/{self.site_id}/drives"
+        drives = requests.get(drives_url, headers=self.headers).json()
+        drive = next((d for d in drives["value"] if d["name"] == self.library_title), None)
+        if not drive:
+            raise Exception(f"Drive (library) named '{self.library_title}' not found on site.")
+        return drive["id"]
 
-    def get_directory(self, path_to_target: str | Path):
-        """
-        Point context to target directory in SharePoint.
-
-        :param path_to_target: list, list of folder names to get to target folder
-        :return: Folder, target folder or None if not found
-        """
-        if isinstance(path_to_target, str):
-            path_to_target = Path(path_to_target)
-
-        starting_folder = self.root_folder
-        found = False
-        for folder_name in path_to_target.parts:
-            folders = starting_folder.folders
-            self.ctx.load(folders)
-            self.ctx.execute_query()
-
-            found = False
-            for folder in folders:
-                if folder.properties["Name"] == folder_name:
-                    found = True
-                    starting_folder = folder
-                    break
-
-        if found:
-            return starting_folder
+    # -------------------------
+    # Public methods
+    # -------------------------
+    def list_folder(self, folder_name=""):
+        """List files/folders inside the given folder (default = root)."""
+        if not folder_name.strip():
+            url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root/children"
         else:
-            raise Exception(
-                f"Folder {'/'.join(path_to_target.parts)} not found. Your account may not have access to this folder.")
+            encoded = requests.utils.quote(folder_name.strip("/"))
+            folder_url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{encoded}"
+            resp = requests.get(folder_url, headers=self.headers)
+            if resp.status_code != 200:
+                print(f"Folder '{folder_name}' not found. Listing root instead.")
+                url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root/children"
+            else:
+                folder_item = resp.json()
+                url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/items/{folder_item['id']}/children"
+        return requests.get(url, headers=self.headers).json()
 
-    def get_folder_by_link(self, folder_link: str):
+    def print_folder(self, folder_name=""):
+        """Pretty-print contents of a folder."""
+        children = self.list_folder(folder_name)
+        print("FILES:")
+        for item in children.get("value", []):
+            if "file" in item:
+                print(f"{item['name']}\t{item['webUrl']}")
+        print("\nFOLDERS:")
+        for item in children.get("value", []):
+            if "folder" in item:
+                print(f"{item['name']}\t{item['webUrl']}")
+
+    def create_folder(self, folder_path):
         """
-        Get a folder by its SharePoint link, from the root folder.
+        Create a folder (and its parent chain if needed) in SharePoint.
 
-        Example:
-
-            sp = SharePoint(sharepoint_url="https://base_url/sites/ShareFiles", library_title="Main Folder")
-            folder = sp.get_folder_by_link("/sites/ShareFiles/Main Folder/Compliance Team/Target Dir")
-
+        folder_path: path relative to the library root (e.g. "HCM Audit/Archive/2025")
         """
-        if isinstance(folder_link, Path):
-            folder_link = folder_link.as_posix()
+        parts = folder_path.strip("/").split("/")
+        current_path = ""
 
-        folder_ = self.ctx.web.get_folder_by_server_relative_url(folder_link)
-        self.ctx.load(folder_)
-        self.ctx.execute_query()
-        print(f"Accessed folder: {folder_.properties['Name']}")
-        return folder_
+        created_folder = None
+        for part in parts:
+            current_path = f"{current_path}/{part}" if current_path else part
+            encoded_path = requests.utils.quote(current_path)
 
-    def get_files(self, path_to_files: str | Path | Folder) -> Generator[File]:
+            # Check if it already exists
+            url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{encoded_path}"
+            resp = requests.get(url, headers=self.headers)
+
+            if resp.status_code == 200:
+                # Folder already exists
+                created_folder = resp.json()
+                continue
+
+            # Otherwise create it under its parent
+            parent_path = "/".join(current_path.split("/")[:-1])
+            if parent_path:
+                parent_encoded = requests.utils.quote(parent_path)
+                create_url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{parent_encoded}:/children"
+            else:
+                create_url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root/children"
+
+            body = {
+                "name": part,
+                "folder": {},
+                "@microsoft.graph.conflictBehavior": "fail"
+            }
+            resp = requests.post(create_url, headers=self.headers, json=body)
+            resp.raise_for_status()
+            created_folder = resp.json()
+            print(f"📁 Created folder: {current_path}")
+
+        return created_folder
+
+    def get_files(self, folder_name=""):
         """
-        Generator for files in a SharePoint folder.
-
-        :param path_to_files: Path, path to target folder.
-
-        Example:
-
-            folder = sp.get_folder_by_link("/sites/ShareFiles/Main Folder")
-            for f in get_folder_files(folder):
-                print(f.properties['Name'])
+        Return a list of file metadata objects in the given folder.
+        Each object includes id, name, webUrl, size, lastModifiedDateTime, etc.
         """
-        if isinstance(path_to_files, str):
-            path_to_files = Path(path_to_files)
-        if isinstance(path_to_files, Path):
-            directory = self.get_directory(path_to_files)
-            files_ = directory.files
-        else: # Folder
-            files_ = path_to_files.files
-        self.ctx.load(files_)
-        self.ctx.execute_query()
-        for f in files_:
-            yield f
+        children = self.list_folder(folder_name)
+        return [item for item in children.get("value", []) if "file" in item]
 
-    def get_all_files(self, files_path: str | Path) -> list[File]:
+    def get_folders(self, folder_name=""):
         """
-        Get a list of all file objects from a SharePoint directory.
-
-        :param files_path: Path, path to target folder
+        Return a list of folder metadata objects in the given folder.
         """
-        if isinstance(files_path, str):
-            files_path = Path(files_path)
+        children = self.list_folder(folder_name)
+        return [item for item in children.get("value", []) if "folder" in item]
 
-        file_obj_list = []
-        for file_ in self.get_files(files_path):
-            file_obj_list.append(file_)
 
-        return file_obj_list
+    def download_files(self, folder_name="", download_dir="downloads"):
+        """Download all files in a folder to `download_dir`."""
+        os.makedirs(download_dir, exist_ok=True)
+        children = self.list_folder(folder_name)
+        for item in children.get("value", []):
+            if "file" in item:
+                url = item["@microsoft.graph.downloadUrl"]
+                local_path = os.path.join(download_dir, item["name"])
+                print(f"⬇ Downloading {item['name']} ...")
+                resp = requests.get(url)
+                resp.raise_for_status()
+                with open(local_path, "wb") as f:
+                    f.write(resp.content)
+                print(f"✅ Saved to {local_path}")
 
-    def upload_file(self, local_file: str | Path, path_to_target: str | Path) -> None:
+    def download_file(self, file_path, download_dir="downloads", new_name=None):
+        """
+        Download a single file from SharePoint.
+
+        file_path: path to the file relative to library root
+                   (e.g. "HCM Audit/250711 - HCM Audit Findings.xlsx")
+        download_dir: local folder to save into (default "downloads")
+        new_name: optional new filename for saving locally
+        """
+        os.makedirs(download_dir, exist_ok=True)
+        if isinstance(file_path, dict) and "webUrl" in file_path:
+            file_path = file_path["webUrl"]
+
+        # Resolve the file item
+        encoded_path = requests.utils.quote(file_path.strip("/"))
+        url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{encoded_path}"
+        resp = requests.get(url, headers=self.headers)
+        resp.raise_for_status()
+        file_item = resp.json()
+
+        if "@microsoft.graph.downloadUrl" not in file_item:
+            raise Exception(f"Item '{file_path}' is not a file or has no download URL")
+
+        # Get the direct download link
+        download_url = file_item["@microsoft.graph.downloadUrl"]
+
+        # Choose local filename
+        local_filename = new_name if new_name else file_item["name"]
+        local_path = os.path.join(download_dir, local_filename)
+
+        # Download
+        print(f"⬇ Downloading {file_item['name']} ...")
+        file_resp = requests.get(download_url)
+        file_resp.raise_for_status()
+
+        with open(local_path, "wb") as f:
+            f.write(file_resp.content)
+
+        print(f"✅ Saved to {local_path}")
+        return local_path
+
+
+    def upload_file(self, local_path, target_folder="", chunk_size=5*1024*1024):
         """
         Upload a file to SharePoint.
-
-        :param local_file: str, local file path
-        :param path_to_target: list, list of folder names to get to target folder
+        - If file <= 4MB, does simple PUT.
+        - If file > 4MB, uses an upload session (chunked).
         """
-        if isinstance(path_to_target, str):
-            path_to_target = Path(path_to_target)
-
-        print(f'Uploading "{local_file}" to "{"/".join(path_to_target.parts)}"')
-        directory = self.get_directory(path_to_target)
-        print(f'Selected directory {directory.resource_url} {directory.properties}')
-        with open(local_file, 'rb') as file_input:
-            file_content = file_input.read()
-            directory.upload_file(os.path.basename(local_file), file_content)  # .execute_query()
-            self.ctx.execute_query()
-            print('File uploaded')
-
-    @staticmethod
-    def download_file(file_obj: File, dest_path: str | None = None, file_name: str | None = None) -> str:
-        """
-        Download a file from SharePoint.
-
-        :param file_obj: File, SharePoint File object.
-        :param dest_path: Str, directory to download to.
-        :param file_name: Str, name of the file to download.
-
-        Example:
-
-            sp = SharePoint()
-            files = sp.get_file_objects(["Audit Folder"])
-            for file in files:
-                sp.download_file(file, dest_path='Workday')
-
-        """
-        if dest_path is None:
-            dest_path = os.getcwd()
-
-        if file_name is None:
-            dest_file = os.path.join(dest_path, file_obj.properties['Name'])
+        file_name = os.path.basename(local_path)
+        folder_path = target_folder.strip("/")
+        if folder_path:
+            item_path = f"{folder_path}/{file_name}"
         else:
-            dest_file = os.path.join(dest_path, file_name)
+            item_path = file_name
 
-        with open(dest_file, "wb") as local_file:
-            file_obj.download(local_file).execute_query()
+        file_size = os.path.getsize(local_path)
 
-        return dest_file
+        if file_size <= 4 * 1024 * 1024:  # small file
+            url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{item_path}:/content"
+            with open(local_path, "rb") as f:
+                resp = requests.put(url, headers=self.headers, data=f)
+            resp.raise_for_status()
+            print(f"✅ Uploaded small file: {item_path}")
+            return resp.json()
 
-    def delete_file(self, file_obj: File):
+        # Large file: use upload session
+        url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{item_path}:/createUploadSession"
+        session = requests.post(url, headers=self.headers, json={"item": {"@microsoft.graph.conflictBehavior": "replace"}})
+        session.raise_for_status()
+        upload_url = session.json()["uploadUrl"]
+
+        with open(local_path, "rb") as f:
+            i = 0
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                start = i * chunk_size
+                end = start + len(chunk) - 1
+                headers = {
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"bytes {start}-{end}/{file_size}"
+                }
+                resp = requests.put(upload_url, headers=headers, data=chunk)
+                resp.raise_for_status()
+                i += 1
+
+        print(f"✅ Uploaded large file: {item_path}")
+        return resp.json()
+
+    def move_file(self, file_path, target_folder):
         """
-        Delete a file from SharePoint using its server-relative URL.
+        Move a file to another folder in the same library.
 
-        Example:
-
-            sp.delete_file(file_obj)
-
+        file_path: path to the file relative to the drive root (e.g. "HR/Payroll/report.xlsx")
+        target_folder: target folder path relative to root (e.g. "HR/Archive")
         """
-        try:
-            file = self.ctx.web.get_file_by_server_relative_url(file_obj.serverRelativeUrl)
-            file.delete_object()
-            self.ctx.execute_query()
-            print(f"Deleted file: {file.properties['Name']}")
-        except Exception as e:
-            print(f"Failed to delete file. Error: {e}")
+        # Get the file item first
+        encoded_path = requests.utils.quote(file_path.strip("/"))
+        url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{encoded_path}"
+        resp = requests.get(url, headers=self.headers)
+        resp.raise_for_status()
+        file_item = resp.json()
+        file_id = file_item["id"]
 
-    def get_file_binary_contents(self, file_obj: File):
-        response = file_obj.read()
-        self.ctx.execute_query()
-        return BytesIO(response)
+        # Resolve target folder
+        encoded_target = requests.utils.quote(target_folder.strip("/"))
+        folder_url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{encoded_target}"
+        resp = requests.get(folder_url, headers=self.headers)
+        resp.raise_for_status()
+        folder_item = resp.json()
+        folder_id = folder_item["id"]
 
-    def move_file(self, file_obj: File, file_path: str | Path | Folder) -> None:
+        # Issue PATCH to move
+        patch_url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/items/{file_id}"
+        body = {
+            "parentReference": {
+                "id": folder_id
+            }
+        }
+        move_resp = requests.patch(patch_url, headers=self.headers, json=body)
+        move_resp.raise_for_status()
+
+        print(f"✅ Moved '{file_path}' → '{target_folder}/'")
+        return move_resp.json()
+
+    def rename_file(self, file_path, new_name):
         """
-        Move a file in SharePoint.
+        Rename a file in SharePoint.
 
-        :param: File, file object to move
-        :param: Path, str with the file path
-
-        Example:
-
-            sp = SharePoint()
-            files = sp.get_files(["Audit Folder"])
-            for file in files:
-                sp.move_file(file, '')
+        file_path: current path of the file relative to library root
+                   (e.g. "HCM Audit/250711 - HCM Audit Findings.xlsx")
+        new_name:  new filename (just the name, not a path, e.g. "Findings_2025.xlsx")
         """
-        if isinstance(file_path, str):
-            file_path = Path(file_path)
+        # Resolve the file item
+        encoded_path = requests.utils.quote(file_path.strip("/"))
+        url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{encoded_path}"
+        resp = requests.get(url, headers=self.headers)
+        resp.raise_for_status()
+        file_item = resp.json()
+        file_id = file_item["id"]
 
-        file_path = self.get_directory(file_path)
-        file_obj.moveto(file_path, 1)  # flag = 1 means overwrite if exists
-        self.ctx.execute_query()
+        # Rename via PATCH
+        patch_url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/items/{file_id}"
+        body = {"name": new_name}
+        rename_resp = requests.patch(patch_url, headers=self.headers, json=body)
+        rename_resp.raise_for_status()
 
-    def archive_files(self, file_obj_list: list[File], dir_path: str | Path, sub_folder_name: str) -> None:
-        """
-        Move processed files to archive folder in SharePoint. This will create a folder called 'Archive' in the
-        dir_path variable (if doesn't already exist) and then create a subfolder named as the archive_folder variable.
-
-        :param file_obj_list: Path, path to sharepoint file objects to archive.
-        :param dir_path: Path, path to target folder.
-        :param sub_folder_name: str, name of archive folder within 'Archive'
-
-        Example:
-
-            sp = SharePointContext()
-            files_path = "Dir 1/Another Dir/Final Dir"
-            file_obj_list = sp.get_file_objects(files_path)
-            sp.archive_files(file_obj_list=file_obj_list, dir_path=files_path, archive_folder='Archive 2024-11-01')
-
-        """
-        if isinstance(dir_path, str):
-            dir_path = Path(dir_path)
-
-        if len(file_obj_list) > 0:
-            self.create_directory(dir_path, 'Archive')
-            new_dir = self.create_directory(dir_path / 'Archive', sub_folder_name)
-            for file in file_obj_list:
-                print(f'Moving file to archive: {file.properties["Name"]}')
-                try:
-                    self.move_file(file, new_dir)
-                except Exception as e:
-                    print(f'Error moving file to archive: {file.properties["Name"]}')
-                    print(str(e))
-
-    def upload_copy_delete(self, sp_file: File, target_folder: Folder):
-        """
-        For folders where you don't have access to the full parent directory, use this to upload a copy
-        of the file to a different folder and then delete the original.
-
-        Example:
-
-            archive_folder = sp.get_folder_by_link(f"/sites/ShareFiles/Main Folder/Archive")
-            sp.upload_copy_delete(file_obj, archive_folder)
-        """
-        file_name = sp_file.properties["Name"]
-        file_url = sp_file.properties["ServerRelativeUrl"]
-
-        # 1. Read contents from the source file
-        file_content = File.open_binary(self.ctx, file_url).content
-
-        # 2. Upload to the target
-        target_folder.upload_file(file_name, file_content)
-        self.ctx.execute_query()
-
-        # 3. Delete the original
-        sp_file.delete_object()
-        self.ctx.execute_query()
-
-        print(f"Moved (fallback): {file_name}")
-
+        print(f"✅ Renamed '{file_path}' → '{new_name}'")
+        return rename_resp.json()
