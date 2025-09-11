@@ -369,3 +369,31 @@ class SharePointClient:
 
         print(f"✅ Renamed '{file_path}' → '{new_name}'")
         return rename_resp.json()
+
+    def delete_file(self, file_path):
+        """
+        Delete a file from SharePoint.
+
+        file_path: path to the file relative to the library root
+                   (e.g. "HR/Payroll/report.xlsx")
+        """
+        # Resolve the file item first
+        encoded_path = requests.utils.quote(file_path.strip("/"))
+        url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/root:/{encoded_path}"
+        resp = requests.get(url, headers=self.headers)
+        if resp.status_code == 404:
+            raise FileNotFoundError(f"File '{file_path}' not found in SharePoint.")
+        resp.raise_for_status()
+        file_item = resp.json()
+        file_id = file_item["id"]
+
+        # Issue DELETE request
+        delete_url = f"https://graph.microsoft.com/v1.0/drives/{self.drive_id}/items/{file_id}"
+        del_resp = requests.delete(delete_url, headers=self.headers)
+
+        if del_resp.status_code in (204, 200):
+            print(f"🗑️ Deleted file: {file_path}")
+            return True
+        else:
+            raise Exception(f"Failed to delete file '{file_path}': {del_resp.text}")
+
